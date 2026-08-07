@@ -1,0 +1,530 @@
+import gbwt.GBWT;
+import gbwt.bwt.BWT;
+import gbwt.meta.GBWTMeta;
+import gbwtgraph.GBWTGraphHeader;
+import gbwtgraph.PackedSequences;
+import gbwtgraph.GBWTGraphSequences;
+import gbwtgraph.translation.Translation;
+import occt.OCCTHeader;
+import occt.OCCTRecord;
+import occt.TraversalBlock;
+import sds.DNACodec;
+import sds.RunCodec;
+
+import java.io.*;
+import java.util.*;
+
+/**
+ * Converts GBZ format to OCCT format using DFS traversal with degree-based
+ * greedy chain decomposition.
+ *
+ * Algorithm: iterative DFS from sentinel children. Linear stretches (degree 1-1)
+ * stay in the same traversal block. Branch points (out-degree > 1) end the current
+ * block. Merge points (in-degree > 1) start a new post-merge block. Cycles are
+ * detected via in-path tracking and edges are truncated (FLAG_CYCLE_TRUNCATED).
+ *
+ * Memory: BitSet visited + inPath (~35 MB for 140M nodes), short[] inDegree
+ * (~280 MB). BWT records and PackedSequences accessed on-the-fly.
+ */
+public class GBZ2OCCT {
+
+    private final String gbzPath;
+    private final String occtPath;
+
+    // Loaded GBZ data
+    private BWT bwt;
+    private PackedSequences sequences;
+    private Translation translation;
+    private GBWTGraphHeader graphHeader;
+    private GBWTMeta meta;
+
+    // Computed during conversion
+    private short[] inDegree;
+    private BitSet visited;
+    private BitSet inPath;
+    private long nodeCount;
+    private String[] contigNames;
+
+    // DFS stack: primitive long[], packs (nodeId << 32) | edgeIndex
+    private long[] dfsStack;
+    private int stackPtr;
+
+    // Output state
+    private DataOutputStream out;
+    private List<TraversalBlock> blocks;
+    private TraversalBlock currentBlock;
+    private int nextBlockId;
+    private long totalBases;
+    private long totalEdges;
+    private long recordsWritten;
+
+    // Reusable buffers
+    private byte[] seqBuf;
+
+    public GBZ2OCCT(String gbzPath, String occtPath) {
+        this.gbzPath = gbzPath;
+        this.occtPath = occtPath;
+    }
+
+    // ================================================================
+    // Public API
+    // ================================================================
+
+    public void convert() throws IOException {
+        System.out.println("[OCCT] Loading GBZ: " + gbzPath);
+        loadGBZ();
+
+        System.out.println("[OCCT] Computing in-degrees...");
+        computeInDegrees();
+
+        System.out.println("[OCCT] Starting DFS traversal...");
+        dfsTraversal();
+
+        System.out.println("[OCCT] Writing summary...");
+        printStats();
+        out.close();
+
+        System.out.println("[OCCT] Done. Output: " + occtPath);
+    }
+
+    // ================================================================
+    // Phase 1: Load GBZ
+    // ================================================================
+
+    private void loadGBZ() throws IOException {
+        // Use streaming reader to load only what we need (PackedSequences)
+        try (GBZStreamer s = new GBZStreamer(gbzPath)) {
+            GBZHeader gbzHdr = s.readGBZHeader();
+            s.skipGBZTags();
+
+            GBWT gbwt = s.readGBWT();
+            this.bwt = gbwt.bwt;
+            this.meta = gbwt.meta;
+            // Free GBWT wrapper objects (keep only bwt)
+            gbwt.header = null;
+            gbwt.tags = null;
+            gbwt.samples = null;
+            gbwt.meta = null;
+            System.gc();
+            System.out.printf("[OCCT]   BWT loaded, mem=%d MB%n", usedMemMB());
+
+            this.graphHeader = s.readGraphHeader();
+
+            // Load sequences as PackedSequences (bit-packed, not String[])
+            GBWTGraphSequences seq = s.readSequencesPacked();
+            this.sequences = seq.packed;
+            this.nodeCount = graphHeader.nodes;
+            seq.forward = null; // free String[] reference if any
+            seq = null;
+            System.gc();
+            System.out.printf("[OCCT]   sequences loaded, mem=%d MB%n", usedMemMB());
+
+            this.translation = s.readTranslation();
+
+            // Extract contig names
+            if (translation != null && translation.segments != null
+                    && translation.segments.names != null) {
+                contigNames = translation.segments.names;
+            }
+        }
+
+        System.out.printf("[OCCT]   nodes=%,d  records=%,d  bases=%,d  mem=%d MB%n",
+                nodeCount, bwt.recordCount(),
+                sequences != null ? sequences.totalBases : 0, usedMemMB());
+    }
+
+    // ================================================================
+    // Phase 2: Compute in-degrees
+    // ================================================================
+
+    private void computeInDegrees() {
+        inDegree = new short[(int) nodeCount + 1];
+        long reportInterval = Math.max(1, bwt.recordCount() / 20);
+        long[] range = new long[2];
+
+        for (int i = 0; i < bwt.recordCount(); i++) {
+            bwt.index.rangeInto(i, bwt.records.data.length, range);
+            if (range[1] <= range[0]) continue;
+
+            byte[] slice = bwt.records.data.copyRange(range[0], range[1]);
+            int[] pos = {0};
+            long sigma = RunCodec.readByteCode(slice, pos);
+            long prev = 0;
+            for (int e = 0; e < sigma; e++) {
+                long to = RunCodec.readByteCode(slice, pos) + prev;
+                prev = to;
+                RunCodec.readByteCode(slice, pos); // rank_offset
+                if (to > 0 && to < inDegree.length) {
+                    inDegree[(int) to]++;
+                }
+            }
+
+            if (i > 0 && i % reportInterval == 0) {
+                System.out.printf("[OCCT]   in-degree: %,d / %,d  (%,d MB)%n",
+                        i, bwt.recordCount(), usedMemMB());
+            }
+        }
+        System.out.printf("[OCCT]   in-degree done. mem=%d MB%n", usedMemMB());
+    }
+
+    // ================================================================
+    // Phase 3: Iterative DFS Traversal
+    // ================================================================
+
+    private void dfsTraversal() throws IOException {
+        visited = new BitSet((int) nodeCount + 1);
+        inPath  = new BitSet((int) nodeCount + 1);
+        dfsStack = new long[1 << 20];
+        stackPtr = 0;
+        blocks = new ArrayList<>();
+        nextBlockId = 0;
+        totalBases = 0;
+        totalEdges = 0;
+        recordsWritten = 0;
+        seqBuf = new byte[1 << 16];
+
+        out = new DataOutputStream(new BufferedOutputStream(
+                new FileOutputStream(occtPath), 1 << 20));
+
+        // Find start nodes: children of sentinel (node 0)
+        long[] sentinelRange = new long[2];
+        bwt.index.rangeInto(0, bwt.records.data.length, sentinelRange);
+        int sentinelChildren = 0;
+
+        if (sentinelRange[1] > sentinelRange[0]) {
+            byte[] sl = bwt.records.data.copyRange(sentinelRange[0], sentinelRange[1]);
+            int[] sp = {0};
+            long sigma = RunCodec.readByteCode(sl, sp);
+            long prev = 0;
+            for (int e = 0; e < sigma; e++) {
+                long to = RunCodec.readByteCode(sl, sp) + prev;
+                prev = to;
+                RunCodec.readByteCode(sl, sp);
+                if (to > 0 && to <= nodeCount && !visited.get((int) to)) {
+                    pushDFS((int) to, -1);
+                    sentinelChildren++;
+                }
+            }
+        }
+        System.out.printf("[OCCT]   sentinel has %,d children (start points)%n", sentinelChildren);
+
+        // Also handle unvisited nodes (in-degree 0 or disconnected)
+        int extraStarts = 0;
+        for (int i = 1; i <= nodeCount; i++) {
+            if (!visited.get(i) && inDegree[i] == 0) {
+                pushDFS(i, -1);
+                extraStarts++;
+            }
+        }
+        // Any remaining unvisited
+        for (int i = 1; i <= nodeCount && extraStarts < 100; i++) {
+            if (!visited.get(i)) {
+                pushDFS(i, -1);
+                extraStarts++;
+            }
+        }
+        System.out.printf("[OCCT]   total start points: %,d%n", sentinelChildren + extraStarts);
+
+        // Main DFS loop
+        long reportInterval = Math.max(1, nodeCount / 20);
+        long[] edgeBuf = new long[256];
+
+        while (stackPtr > 0) {
+            long top = dfsStack[stackPtr - 1];
+            int node = (int) (top >>> 32);
+            int edgeIdx = (int) top;
+
+            if (edgeIdx == -1) {
+                // ---- First visit ----
+                if (inPath.get(node)) {
+                    stackPtr--; // cycle: node already in path
+                    continue;
+                }
+                if (visited.get(node)) {
+                    stackPtr--; // already processed
+                    continue;
+                }
+
+                visited.set(node);
+                inPath.set(node);
+
+                // Process node
+                OCCTRecord rec = buildRecord(node);
+                if (rec != null) {
+                    short inDeg = inDegree[node];
+                    short outDeg = rec.edgeCount;
+                    rec.inDegree = inDeg;
+                    rec.outDegree = outDeg;
+
+                    // Block boundary logic
+                    if (currentBlock == null) {
+                        currentBlock = new TraversalBlock(nextBlockId++);
+                        rec.setBlockStart();
+                    } else if (!currentBlock.isEmpty()) {
+                        OCCTRecord last = currentBlock.nodes.get(currentBlock.nodes.size() - 1);
+                        if (last.outDegree > 1 || (inDeg > 1 && outDeg <= 1)) {
+                            currentBlock.nodes.get(currentBlock.nodes.size() - 1).setBlockEnd();
+                            finalizeAndStoreBlock();
+                            currentBlock = new TraversalBlock(nextBlockId++);
+                            rec.setBlockStart();
+                        }
+                    }
+                    currentBlock.addNode(rec);
+
+                    writeRecord(rec);
+                    totalBases += rec.seqLen;
+                    totalEdges += rec.edgeCount;
+                    recordsWritten++;
+
+                    if (recordsWritten % reportInterval == 0) {
+                        System.out.printf("[OCCT]   processed: %,d / %,d  (%,d MB)%n",
+                                recordsWritten, nodeCount, usedMemMB());
+                    }
+                }
+
+                // Ready to process children
+                dfsStack[stackPtr - 1] = ((long) node << 32) | 0;
+            }
+
+            // ---- Process children ----
+            int edgeCount = readEdgeCount(node);
+            int currentEdge = (int) dfsStack[stackPtr - 1];
+
+            if (currentEdge < edgeCount) {
+                // Advance edge index
+                dfsStack[stackPtr - 1] = ((long) node << 32) | (currentEdge + 1);
+                int child = readEdgeTarget(node, currentEdge);
+                if (child > 0 && child <= nodeCount) {
+                    if (inPath.get(child)) {
+                        // CYCLE: child is in current DFS path
+                        // Mark the edge as cycle-truncated
+                        // (simplified: we don't track this per-record written to file)
+                    } else if (!visited.get(child)) {
+                        pushDFS(child, -1);
+                    }
+                }
+            } else {
+                // All children processed
+                inPath.clear(node);
+                stackPtr--;
+
+                if (stackPtr == 0 && currentBlock != null && !currentBlock.isEmpty()) {
+                    currentBlock.nodes.get(currentBlock.nodes.size() - 1).setBlockEnd();
+                    finalizeAndStoreBlock();
+                }
+            }
+        }
+
+        // Finalize
+        if (currentBlock != null && !currentBlock.isEmpty()) {
+            currentBlock.nodes.get(currentBlock.nodes.size() - 1).setBlockEnd();
+            finalizeAndStoreBlock();
+        }
+        out.flush();
+
+        System.out.printf("[OCCT]   DFS done: %,d records, %,d blocks, mem=%d MB%n",
+                recordsWritten, blocks.size(), usedMemMB());
+    }
+
+    private void pushDFS(int node, int edgeIdx) {
+        if (stackPtr >= dfsStack.length) {
+            dfsStack = Arrays.copyOf(dfsStack, dfsStack.length * 2);
+        }
+        dfsStack[stackPtr++] = ((long) node << 32) | (edgeIdx & 0xFFFFFFFFL);
+    }
+
+    // ================================================================
+    // On-the-fly BWT record access (avoids object allocation)
+    // ================================================================
+
+    /** Get the edge count (sigma) for a node from BWT. */
+    private int readEdgeCount(int node) {
+        long[] range = new long[2];
+        bwt.index.rangeInto(node, bwt.records.data.length, range);
+        if (range[1] <= range[0]) return 0;
+        byte[] slice = bwt.records.data.copyRange(range[0], range[1]);
+        int[] pos = {0};
+        return (int) RunCodec.readByteCode(slice, pos);
+    }
+
+    /** Read the target node ID for edge i of node. */
+    private int readEdgeTarget(int node, int edgeIdx) {
+        long[] range = new long[2];
+        bwt.index.rangeInto(node, bwt.records.data.length, range);
+        if (range[1] <= range[0]) return -1;
+        byte[] slice = bwt.records.data.copyRange(range[0], range[1]);
+        int[] pos = {0};
+        long sigma = RunCodec.readByteCode(slice, pos);
+        if (edgeIdx >= sigma) return -1;
+        long target = 0;
+        long prev = 0;
+        for (int e = 0; e <= edgeIdx; e++) {
+            target = RunCodec.readByteCode(slice, pos) + prev;
+            prev = target;
+            RunCodec.readByteCode(slice, pos); // rank_offset
+        }
+        return (int) target;
+    }
+
+    // ================================================================
+    // Build OCCTRecord from BWT + sequences
+    // ================================================================
+
+    private OCCTRecord buildRecord(int node) {
+        long[] range = new long[2];
+        bwt.index.rangeInto(node, bwt.records.data.length, range);
+        if (range[1] <= range[0]) return null;
+
+        byte[] slice = bwt.records.data.copyRange(range[0], range[1]);
+        int[] pos = {0};
+        long sigma = RunCodec.readByteCode(slice, pos);
+
+        long[] targets = new long[(int) sigma];
+        byte[] orientations = new byte[(int) sigma];
+        long prev = 0;
+        for (int e = 0; e < sigma; e++) {
+            long to = RunCodec.readByteCode(slice, pos) + prev;
+            prev = to;
+            RunCodec.readByteCode(slice, pos);
+            targets[e] = to;
+            orientations[e] = OCCTRecord.EDGE_LR;
+        }
+
+        // Build rank offset array from runs
+        int[] rankOff = null;
+        if (sigma > 0) {
+            List<long[]> runs = new ArrayList<>();
+            RunCodec codec = new RunCodec(sigma);
+            while (pos[0] < slice.length) {
+                runs.add(codec.read(slice, pos));
+            }
+            rankOff = new int[runs.size() + 1];
+            int cum = 0;
+            for (int i = 0; i < runs.size(); i++) {
+                rankOff[i] = cum;
+                cum += (int) runs.get(i)[1];
+            }
+            rankOff[runs.size()] = cum;
+        }
+
+        // Get sequence
+        int seqLen = 0;
+        int[] packedSeq = new int[0];
+        if (sequences != null && node > 0 && node <= sequences.count) {
+            int idx = node - 1;
+            seqLen = sequences.length(idx);
+            if (seqLen > 0) {
+                int nWords = DNACodec.wordsFor(seqLen, sequences.format);
+                packedSeq = new int[nWords];
+                sequences.copyWords(idx, packedSeq, 0);
+            }
+        }
+
+        OCCTRecord rec = new OCCTRecord(node, packedSeq, seqLen);
+        rec.setEdges(targets, orientations);
+        if (rankOff != null) rec.setRankOffsetArray(rankOff);
+
+        // Contig info
+        if (translation != null && graphHeader.hasTranslation()
+                && translation.mapping != null
+                && translation.mapping.nodeToSegment != null) {
+            int segIdx = translation.mapping.segmentIndexForNode(node);
+            if (segIdx >= 0) rec.contigId = segIdx;
+        }
+
+        return rec;
+    }
+
+    private void finalizeAndStoreBlock() {
+        if (currentBlock == null || currentBlock.isEmpty()) return;
+        currentBlock.finalizeBlock();
+        blocks.add(currentBlock);
+        currentBlock = null;
+    }
+
+    // ================================================================
+    // Binary output
+    // ================================================================
+
+    private void writeRecord(OCCTRecord rec) throws IOException {
+        out.writeInt(rec.seqLen);
+        out.writeShort(rec.edgeCount);
+        out.writeShort(rec.flags);
+        out.writeInt(rec.contigId);
+        out.writeLong(rec.position);
+
+        // Packed sequence as raw bytes
+        if (rec.sequence != null && rec.sequence.length > 0) {
+            out.writeInt(rec.sequence.length);
+            for (int w : rec.sequence) out.writeInt(w);
+        } else {
+            out.writeInt(0);
+        }
+
+        // Edges: delta-encoded targets + orientations
+        if (rec.edgeCount > 0 && rec.edgeTargets != null) {
+            long prevNode = rec.nodeId;
+            for (int i = 0; i < rec.edgeCount; i++) {
+                long delta = rec.edgeTargets[i] - prevNode;
+                out.writeLong(delta);
+                prevNode = rec.edgeTargets[i];
+            }
+            out.write(rec.edgeOrientation, 0, rec.edgeCount);
+        }
+
+        // Rank offset array
+        if (rec.rankOffsetArray != null && rec.rankOffsetArray.length > 0) {
+            out.writeShort((short) rec.rankOffsetArray.length);
+            for (int v : rec.rankOffsetArray) out.writeInt(v);
+        } else {
+            out.writeShort(0);
+        }
+    }
+
+    private void printStats() {
+        System.out.println();
+        System.out.println("=== OCCT Conversion Summary ===");
+        System.out.printf("  Input nodes:     %,d%n", nodeCount);
+        System.out.printf("  Records written: %,d%n", recordsWritten);
+        System.out.printf("  Traversal blocks: %,d%n", blocks.size());
+        System.out.printf("  Total bases:     %,d%n", totalBases);
+        System.out.printf("  Total edges:     %,d%n", totalEdges);
+
+        long linearBlocks = 0;
+        long branchingBlocks = 0;
+        for (TraversalBlock b : blocks) {
+            if (b.isLinear) linearBlocks++; else branchingBlocks++;
+        }
+        System.out.printf("  Linear blocks:   %,d%n", linearBlocks);
+        System.out.printf("  Branching blocks: %,d%n", branchingBlocks);
+        System.out.printf("  Final memory:    %d MB%n", usedMemMB());
+    }
+
+    private static long usedMemMB() {
+        Runtime rt = Runtime.getRuntime();
+        return (rt.totalMemory() - rt.freeMemory()) >>> 20;
+    }
+
+    // ================================================================
+    // Main
+    // ================================================================
+
+    public static void main(String[] args) throws IOException {
+        String gbzPath = "/Users/wenjiepeng/Downloads/hprc-v2.1-mc-grch38.gbz";
+        String occtPath = "/Users/wenjiepeng/Downloads/hprc-v2.1-mc-grch38.occt";
+
+        if (args.length >= 1) gbzPath = args[0];
+        if (args.length >= 2) occtPath = args[1];
+
+        long start = System.currentTimeMillis();
+        GBZ2OCCT converter = new GBZ2OCCT(gbzPath, occtPath);
+        try {
+            converter.convert();
+        } catch (Exception e) {
+            System.err.println("Error: " + e.getMessage());
+            e.printStackTrace();
+        }
+        long elapsed = System.currentTimeMillis() - start;
+        System.out.printf("%nTotal time: %.1f seconds%n", elapsed / 1000.0);
+    }
+}

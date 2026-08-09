@@ -1,6 +1,6 @@
 # GBZ 文件格式逐字节解析文档
 
-> 本文档基于项目源码逐字段分析，描述 `simple_sds` 序列化格式的 GBZ 文件（`.gbz`），对应论文 2.3.5 节。文件底层是 **unsigned little-endian 64-bit integers** 构成的元素数组（`u64`），所有解析均从文件偏移 0 开始顺序消费。
+> 文件底层是 **unsigned little-endian 64-bit integers** 构成的元素数组（`u64`），所有解析均从文件偏移 0 开始顺序消费。
 
 ---
 
